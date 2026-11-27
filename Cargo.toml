@@ -79,6 +79,10 @@ path = "benches/bin/hpke.rs"
 name = "report-gen-bench"
 path = "benches/bin/report_gen_bench.rs"
 
+[[bin]]
+name = "dropout-bench"
+path = "benches/bin/dropout_bench.rs"
+
 # Experiment binaries
 [[bin]]
 name = "generate_keys"

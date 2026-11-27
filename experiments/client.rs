@@ -27,7 +27,6 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use heli::BATCH_REPORT_SIZE;
-const CLIENT_DB_PATH: &str = "/tmp/heli_client.db";
 
 #[derive(Parser, Debug)]
 #[command(name = "client")]
@@ -42,6 +41,10 @@ struct Args {
     /// Maximum number of concurrent connections (default: 1000)
     #[arg(long, short = 'c', default_value = "1000")]
     max_concurrency: usize,
+
+    /// Path to the client's sled database
+    #[arg(long, default_value = "/tmp/heli_client.db")]
+    client_db: PathBuf,
 
     /// Clear the client database (delete entire DB) before running
     #[arg(long)]
@@ -775,15 +778,11 @@ async fn main() -> Result<()> {
     let config = ExperimentConfig::from_file(&args.config)?;
     info!("Loaded config: {:?}", config);
 
-    let db = Arc::new(if args.clear_db {
-        if std::path::Path::new(CLIENT_DB_PATH).exists() {
-            std::fs::remove_dir_all(CLIENT_DB_PATH)?;
-        }
+    if args.clear_db && args.client_db.exists() {
+        std::fs::remove_dir_all(&args.client_db)?;
         info!("Cleared database");
-        sled::Config::default().path(CLIENT_DB_PATH).open()?
-    } else {
-        sled::Config::default().path(CLIENT_DB_PATH).open()?
-    });
+    }
+    let db = Arc::new(sled::Config::default().path(&args.client_db).open()?);
 
     if args.clear_reports {
         clear_reports_from_db(&db)?;
