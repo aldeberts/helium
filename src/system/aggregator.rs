@@ -2,15 +2,17 @@ use crate::{
     BATCH_REPORT_SIZE,
     agg_only_enc::{AggOnlyEnc, Ciphertext},
     crypto::{
-        G,
+        G, Scalar,
         hpke::{ServerKeys, hpke_decrypt},
+        paillier,
         prf::ScalarPRF,
     },
+    dropout::{DropoutProof, DropoutProverKey, DropoutVerifierKey, KeyRecord},
     proofs::{Proof, VerifierKey},
     system::{ProverType, messages::*},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use group::Group;
 use rand::rngs::OsRng;
 use rand_chacha::ChaCha20Rng;
@@ -20,19 +22,36 @@ use sled::Db;
 use std::{collections::HashSet, sync::Arc, time::Instant};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, OnceCell, RwLock, mpsc},
+    sync::{Mutex, OnceCell, RwLock, mpsc, watch},
 };
 use tracing::{debug, error, info};
 
 const VERIFY_BATCH_SIZE: usize = 128;
 
-/// When true, dropout indices are sent to the decryptor as 3-byte packed ClientIndex values.
-/// When false, they are sent as plain u32s (more bandwidth, but faster serialization).
-const PACK_DROPOUTS: bool = true;
+/// Database key of the key commitments. They are the last thing the setup
+/// writes, so their presence marks it as complete.
+const KEY_COMMITMENTS_DB_KEY: &[u8] = b"kc";
+
+const DROPOUT_PAILLIER_KEY_DB_KEY: &[u8] = b"dropout_paillier_key";
+const DROPOUT_RECORDS_DB_PREFIX: &[u8] = b"dropout_records_";
+
+/// Number of clients whose dropout key records share one database entry.
+const KEY_RECORDS_PER_DB_ENTRY: usize = 4096;
+
+/// Number of clients whose dropout key records are derived at a time in a simulated setup.
+const SIMULATED_SETUP_CHUNK_SIZE: usize = 1 << 16;
 
 pub struct Aggregator {
     addr: String,
     state: Arc<AggregatorState>,
+}
+
+/// Progress of the one-time setup with the decryptor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupState {
+    Pending,
+    Complete,
+    Failed,
 }
 
 pub struct AggregatorState {
@@ -42,6 +61,9 @@ pub struct AggregatorState {
     db: Db,
     hpke_keys: ServerKeys,
     current_ctx: RwLock<Option<u32>>,
+    setup: watch::Sender<SetupState>,
+    /// Loaded from the database on first use after a restart.
+    dropout_key: OnceCell<Arc<DropoutProverKey>>,
     request_send: OnceCell<mpsc::Sender<Message>>,
     mask_recv: Mutex<Option<mpsc::Receiver<Message>>>,
     max_pending_batches: usize,
@@ -59,12 +81,18 @@ impl Aggregator {
         max_pending_batches: usize,
         reports_per_chunk: usize,
     ) -> Self {
+        let setup = match db.contains_key(KEY_COMMITMENTS_DB_KEY) {
+            Ok(true) => SetupState::Complete,
+            _ => SetupState::Pending,
+        };
         let state = Arc::new(AggregatorState {
             num_clients,
             threshold,
             db,
             hpke_keys,
             current_ctx: RwLock::new(None),
+            setup: watch::Sender::new(setup),
+            dropout_key: OnceCell::new(),
             request_send: OnceCell::new(),
             mask_recv: Mutex::new(None),
             max_pending_batches,
@@ -201,7 +229,18 @@ impl Aggregator {
         simulated: bool,
         sim_dropouts: Vec<u32>,
     ) -> Result<Vec<u64>> {
+        // Setup encrypts every client's key, so it may still be running.
+        if *state.setup.borrow() == SetupState::Pending {
+            info!("Waiting for setup to complete");
+        }
+        let mut setup = state.setup.subscribe();
+        let setup = *setup
+            .wait_for(|&setup| setup != SetupState::Pending)
+            .await?;
+        ensure!(setup == SetupState::Complete, "Setup failed");
+
         let vk = Self::build_vk(state, binary, bitlength)?;
+        let dropout_key = Self::dropout_key(state).await?;
         let hpke_sk = state.hpke_keys.sk.clone();
 
         // Bounded channel: once full, the reader blocks, applying backpressure to the network
@@ -299,19 +338,29 @@ impl Aggregator {
         let online_count = online_clients.len();
         info!("Aggregation: {online_count} online clients (simulated: {simulated})");
 
-        // Request decryption mask
         let decrypt_start = Instant::now();
-        let dropouts: Vec<usize> = if simulated {
-            sim_dropouts.into_iter().map(|x| x as usize).collect()
+        let dropouts: Vec<u32> = if simulated {
+            sim_dropouts
         } else {
             let online_set: HashSet<_> = online_clients.iter().copied().collect();
-            (0..state.num_clients)
-                .filter(|i| !online_set.contains(&(*i as u32)))
+            (0..state.num_clients as u32)
+                .filter(|i| !online_set.contains(i))
                 .collect()
         };
 
+        // Sum the dropped-out clients' encrypted keys and prove the sum
+        let dropout_count = dropouts.len();
+        let proof_start = Instant::now();
+        let dropout_proof =
+            tokio::task::spawn_blocking(move || dropout_key.prove(&dropouts)).await??;
+        info!(
+            "Dropout proof for {dropout_count} dropouts: {:?}",
+            proof_start.elapsed()
+        );
+
+        // Request decryption mask
         let mask =
-            Self::request_decryption_mask(state, context, &dropouts, aggregate.len()).await?;
+            Self::request_decryption_mask(state, context, dropout_proof, aggregate.len()).await?;
         let mask = match mask {
             Message::DecryptMaskResponse { mask } => mask,
             Message::Error(e) => return Err(anyhow!("Decryptor error: {e}")),
@@ -353,7 +402,7 @@ impl Aggregator {
         let g_comm = Proof::get_g_comm();
         let data = state
             .db
-            .get(b"kc")?
+            .get(KEY_COMMITMENTS_DB_KEY)?
             .ok_or_else(|| anyhow!("No key commitments in DB"))?;
         let key_commitments = Self::deserialize_key_commitments(&data)?;
 
@@ -421,11 +470,17 @@ impl Aggregator {
         mut request_recv: mpsc::Receiver<Message>,
         mask_send: mpsc::Sender<Message>,
     ) -> Result<()> {
-        if state.db.contains_key(b"kc")? {
+        if *state.setup.borrow() == SetupState::Complete {
             info!("Key commitments already exist, skipping setup");
             write_message(&mut socket, &Message::SetupAlreadyComplete {}).await?;
         } else {
-            Self::receive_key_commitments(&mut socket, &state).await?;
+            let result = Self::run_setup(&mut socket, &state).await;
+            let setup = match result {
+                Ok(()) => SetupState::Complete,
+                Err(_) => SetupState::Failed,
+            };
+            state.setup.send_replace(setup);
+            result?;
         }
 
         while let Some(request) = request_recv.recv().await {
@@ -436,86 +491,75 @@ impl Aggregator {
         Ok(())
     }
 
-    async fn receive_key_commitments(
-        socket: &mut TcpStream,
-        state: &AggregatorState,
-    ) -> Result<()> {
+    /// Runs the one-time setup: receives (or, if simulated, derives) each
+    /// client's key commitment and dropout key record, and persists them.
+    async fn run_setup(socket: &mut TcpStream, state: &AggregatorState) -> Result<()> {
         write_message(socket, &Message::Success {}).await?;
 
         let setup_start = Instant::now();
-        let mut key_commitments = vec![G::generator(); state.num_clients];
+        let num_clients = state.num_clients;
 
-        let first_message = read_message(socket).await?;
-        match first_message {
+        let (key_commitments, dropout_key) = match read_message(socket).await? {
             Message::SimulateSetup {} => {
-                let num_clients = state.num_clients;
-                let g_comm = Proof::get_g_comm();
-                key_commitments = tokio::task::spawn_blocking(move || {
-                    let prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
-                    (0..num_clients)
-                        .into_par_iter()
-                        .map(|i| g_comm * prf.evaluate(i as u64))
-                        .collect()
-                })
-                .await?;
+                let keys =
+                    tokio::task::spawn_blocking(move || simulated_client_keys(num_clients)).await?;
                 info!(
-                    "Simulated setup: computed {num_clients} key commitments in {:?}",
+                    "Simulated setup: computed keys for {num_clients} clients in {:?}",
                     setup_start.elapsed()
                 );
                 write_message(socket, &Message::Success {}).await?;
+                keys
             }
-            Message::KeyCommsBatch { key_comms } => {
-                let mut received = Self::apply_key_comms(&mut key_commitments, key_comms);
+            Message::DropoutSetup { paillier_key } => {
                 write_message(socket, &Message::Success {}).await?;
 
-                while received < state.num_clients {
-                    let batch = match read_message(socket).await? {
-                        Message::KeyCommsBatch { key_comms } => key_comms,
-                        _ => return Err(anyhow!("Expected KeyCommsBatch")),
+                let mut key_commitments = vec![G::generator(); num_clients];
+                let mut key_records = vec![None; num_clients];
+                let mut received = 0;
+                while received < num_clients {
+                    let Message::ClientKeysBatch { keys } = read_message(socket).await? else {
+                        return Err(anyhow!("Expected ClientKeysBatch"));
                     };
-                    received += Self::apply_key_comms(&mut key_commitments, batch);
+                    received += keys.len();
+                    for (idx, key_comm, key_record) in keys {
+                        let idx = idx as usize;
+                        ensure!(idx < num_clients, "Client index out of range");
+                        key_commitments[idx] = key_comm;
+                        key_records[idx] = Some(key_record);
+                    }
                     write_message(socket, &Message::Success {}).await?;
                 }
+                let key_records = key_records
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| anyhow!("Missing client keys"))?;
+                (
+                    key_commitments,
+                    DropoutProverKey::new(paillier_key, key_records),
+                )
             }
-            _ => return Err(anyhow!("Expected SimulateSetup or KeyCommsBatch")),
-        }
+            _ => return Err(anyhow!("Expected SimulateSetup or DropoutSetup")),
+        };
 
+        let dropout_key = Arc::new(dropout_key);
         let db = state.db.clone();
-        let num_clients = state.num_clients;
+        let dropout_key_clone = dropout_key.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let serialize_start = Instant::now();
-
-            const CHUNK_SIZE: usize = 100_000;
-            let serialized_chunks: Vec<Vec<u8>> = key_commitments
-                .par_chunks(CHUNK_SIZE)
-                .map(|chunk| bincode::serialize(chunk).unwrap())
-                .collect();
-
-            let total_len: usize = serialized_chunks.iter().map(|c| c.len()).sum();
-            let mut serialized = Vec::with_capacity(total_len + 8 + serialized_chunks.len() * 8);
-            serialized.extend_from_slice(&(num_clients as u64).to_le_bytes());
-            for chunk in serialized_chunks {
-                serialized.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
-                serialized.extend(chunk);
-            }
-
-            info!(
-                "Serialized {} key commitments in {:?}",
-                num_clients,
-                serialize_start.elapsed()
-            );
-
             let write_start = Instant::now();
-            db.insert(b"kc", serialized)?;
+            store_dropout_key(&db, &dropout_key_clone)?;
+            db.insert(
+                KEY_COMMITMENTS_DB_KEY,
+                serialize_key_commitments(&key_commitments),
+            )?;
             db.flush()?;
-            info!("Wrote key commitments to DB in {:?}", write_start.elapsed());
-
+            info!("Wrote client keys to DB in {:?}", write_start.elapsed());
             Ok(())
         })
         .await??;
+        state.dropout_key.set(dropout_key).ok();
 
         info!(
-            "Setup complete: {} key commitments in {:?}",
+            "Setup complete: keys for {} clients in {:?}",
             state.num_clients,
             setup_start.elapsed()
         );
@@ -524,12 +568,19 @@ impl Aggregator {
         Ok(())
     }
 
-    fn apply_key_comms(commitments: &mut [G], batch: Vec<(u32, G)>) -> usize {
-        let count = batch.len();
-        for (idx, kc) in batch {
-            commitments[idx as usize] = kc;
-        }
-        count
+    /// The key for proving dropout-key sums, read from the database if this
+    /// process did not run the setup itself.
+    async fn dropout_key(state: &AggregatorState) -> Result<Arc<DropoutProverKey>> {
+        let load = || async {
+            let db = state.db.clone();
+            let num_clients = state.num_clients;
+            let load_start = Instant::now();
+            let key = tokio::task::spawn_blocking(move || load_dropout_key(&db, num_clients));
+            let key = Arc::new(key.await??);
+            info!("Loaded dropout key from DB in {:?}", load_start.elapsed());
+            Ok::<_, anyhow::Error>(key)
+        };
+        Ok(state.dropout_key.get_or_try_init(load).await?.clone())
     }
 
     // --- Decryption mask request ---
@@ -537,23 +588,17 @@ impl Aggregator {
     async fn request_decryption_mask(
         state: &AggregatorState,
         context: u32,
-        dropouts: &[usize],
+        dropout_proof: DropoutProof,
         length: usize,
     ) -> Result<Message> {
         let sender = state
             .request_send
             .get()
             .ok_or_else(|| anyhow!("Decryptor not connected"))?;
-        let dropouts = if PACK_DROPOUTS {
-            DropoutList::Packed(dropouts.iter().map(|&i| crate::ClientIndex::from(i)).collect())
-        } else {
-            DropoutList::Plain(dropouts.iter().map(|&i| i as u32).collect())
-        };
         sender
             .send(Message::DecryptMaskRequest {
                 context,
-                dropouts,
-                invert: false,
+                dropout_proof,
                 length,
             })
             .await
@@ -567,6 +612,79 @@ impl Aggregator {
             .await
             .ok_or_else(|| anyhow!("Decryptor disconnected"))
     }
+}
+
+// --- Client keys (setup material) ---
+
+/// Derives every client's key commitment and dropout key record from the
+/// fixed keys of a simulated setup.
+fn simulated_client_keys(num_clients: usize) -> (Vec<G>, DropoutProverKey) {
+    let prf = ScalarPRF::new(&SIMULATE_PRF_KEY);
+    let g_comm = Proof::get_g_comm();
+    let eval_keys: Vec<(u32, Scalar)> = (0..num_clients as u32)
+        .into_par_iter()
+        .map(|i| (i, prf.evaluate(i as u64)))
+        .collect();
+    let key_commitments = eval_keys.par_iter().map(|(_, ek)| g_comm * ek).collect();
+
+    let verifier_key = DropoutVerifierKey::simulated(num_clients);
+    let mut key_records = Vec::with_capacity(num_clients);
+    for chunk in eval_keys.chunks(SIMULATED_SETUP_CHUNK_SIZE) {
+        key_records.extend(verifier_key.key_records(chunk));
+    }
+    let dropout_key =
+        DropoutProverKey::new(verifier_key.paillier_public_key().clone(), key_records);
+    (key_commitments, dropout_key)
+}
+
+/// Format: num_clients (u64) + [chunk_len (u64) + chunk_data]*
+fn serialize_key_commitments(key_commitments: &[G]) -> Vec<u8> {
+    const CHUNK_SIZE: usize = 100_000;
+    let serialized_chunks: Vec<Vec<u8>> = key_commitments
+        .par_chunks(CHUNK_SIZE)
+        .map(|chunk| bincode::serialize(chunk).unwrap())
+        .collect();
+
+    let total_len: usize = serialized_chunks.iter().map(|c| c.len()).sum();
+    let mut serialized = Vec::with_capacity(total_len + 8 + serialized_chunks.len() * 8);
+    serialized.extend_from_slice(&(key_commitments.len() as u64).to_le_bytes());
+    for chunk in serialized_chunks {
+        serialized.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+        serialized.extend(chunk);
+    }
+    serialized
+}
+
+/// Stores the key records in fixed-size groups, keyed so that they sort by client index.
+fn store_dropout_key(db: &Db, key: &DropoutProverKey) -> Result<()> {
+    let paillier_key = bincode::serialize(key.paillier_public_key())?;
+    db.insert(DROPOUT_PAILLIER_KEY_DB_KEY, paillier_key)?;
+
+    let groups = key.records().chunks(KEY_RECORDS_PER_DB_ENTRY);
+    for (i, records) in groups.enumerate() {
+        let mut db_key = DROPOUT_RECORDS_DB_PREFIX.to_vec();
+        db_key.extend_from_slice(&(i as u64).to_be_bytes());
+        db.insert(db_key, bincode::serialize(records)?)?;
+    }
+    Ok(())
+}
+
+fn load_dropout_key(db: &Db, num_clients: usize) -> Result<DropoutProverKey> {
+    let paillier_key = db
+        .get(DROPOUT_PAILLIER_KEY_DB_KEY)?
+        .ok_or_else(|| anyhow!("No dropout key in DB"))?;
+    let paillier_key: paillier::PublicKey = bincode::deserialize(&paillier_key)?;
+
+    let mut records: Vec<KeyRecord> = Vec::with_capacity(num_clients);
+    for entry in db.scan_prefix(DROPOUT_RECORDS_DB_PREFIX).values() {
+        records.extend(bincode::deserialize::<Vec<KeyRecord>>(&entry?)?);
+    }
+    ensure!(
+        records.len() == num_clients,
+        "Expected dropout key records for {num_clients} clients, found {}",
+        records.len()
+    );
+    Ok(DropoutProverKey::new(paillier_key, records))
 }
 
 // --- Chunk processing (decrypt, verify, aggregate) ---
@@ -639,4 +757,36 @@ fn process_chunk(
     let agg_time = agg_start.elapsed();
 
     (online, agg, decrypt_time, verify_time, agg_time)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dropout key must survive the database, in order, when its records
+    /// span several entries.
+    #[test]
+    fn dropout_key_roundtrips_through_db() -> Result<()> {
+        let num_clients = 2 * KEY_RECORDS_PER_DB_ENTRY + 3;
+        let verifier_key = DropoutVerifierKey::generate(num_clients, &mut OsRng);
+        // Encrypting is slow, so the records cycle through a few distinct ones.
+        let distinct = verifier_key.key_records(&[
+            (0, Scalar::from(1u64)),
+            (1, Scalar::from(2u64)),
+            (2, Scalar::from(3u64)),
+        ]);
+        let records: Vec<KeyRecord> = distinct.iter().cycle().take(num_clients).cloned().collect();
+        let key = DropoutProverKey::new(verifier_key.paillier_public_key().clone(), records);
+
+        let db = sled::Config::default().temporary(true).open()?;
+        assert!(load_dropout_key(&db, num_clients).is_err());
+        store_dropout_key(&db, &key)?;
+        assert_eq!(db.scan_prefix(DROPOUT_RECORDS_DB_PREFIX).count(), 3);
+
+        let loaded = load_dropout_key(&db, num_clients)?;
+        assert_eq!(loaded.paillier_public_key(), key.paillier_public_key());
+        assert_eq!(loaded.records(), key.records());
+        assert!(load_dropout_key(&db, num_clients - 1).is_err());
+        Ok(())
+    }
 }

@@ -16,6 +16,9 @@ pub use prf::*;
 pub mod hpke;
 pub use hpke::*;
 
+/// Paillier additively homomorphic encryption
+pub mod paillier;
+
 // Code for mocking apple app attest verification
 pub mod app_attest;
 pub use app_attest::*;
