@@ -80,29 +80,6 @@ impl ScalarPRF {
         Self::finalize_accum(accum)
     }
 
-    /// Computes the sum of PRF evaluations over a slice of 3-byte ClientIndex values.
-    pub fn batch_evaluate_client_indices(&self, indices: &[crate::ClientIndex]) -> Scalar {
-        if indices.is_empty() {
-            return Scalar::ZERO;
-        }
-        let mut accum = [0u64; 5];
-        for idx in indices {
-            self.accumulate_eval(&mut accum, u64::from(*idx));
-        }
-        Self::finalize_accum(accum)
-    }
-
-    pub fn batch_evaluate_u32(&self, indices: &[u32]) -> Scalar {
-        if indices.is_empty() {
-            return Scalar::ZERO;
-        }
-        let mut accum = [0u64; 5];
-        for &idx in indices {
-            self.accumulate_eval(&mut accum, idx as u64);
-        }
-        Self::finalize_accum(accum)
-    }
-
     #[inline]
     fn accumulate_eval(&self, accum: &mut [u64; 5], idx: u64) {
         let aes_blocks = self.evaluate_aes(idx);

@@ -1,6 +1,7 @@
 use crate::{
     agg_only_enc::{Ciphertext, EvalKey},
-    crypto::{G, hpke::HpkeEnvelope},
+    crypto::{G, hpke::HpkeEnvelope, paillier},
+    dropout::{DropoutProof, KeyRecord},
     proofs::Proof,
 };
 use anyhow::Result;
@@ -88,13 +89,18 @@ pub enum Message {
     /// Sent by aggregator when setup is already complete (key commitments exist)
     SetupAlreadyComplete {},
 
-    KeyCommsBatch {
-        key_comms: Vec<(u32, G)>, // (idx, key_comm)
+    /// Opens a (non-simulated) setup: the key under which the decryptor
+    /// encrypts the client keys in the batches that follow.
+    DropoutSetup {
+        paillier_key: paillier::PublicKey,
     },
+    ClientKeysBatch {
+        keys: Vec<(u32, G, KeyRecord)>, // (idx, key_comm, key_record)
+    },
+    /// The dropped-out clients are identified only by the proof of their key sum.
     DecryptMaskRequest {
         context: u32,
-        dropouts: DropoutList,
-        invert: bool,
+        dropout_proof: DropoutProof,
         length: usize,
     },
     DecryptMaskResponse {
@@ -122,24 +128,6 @@ pub enum Message {
 
     Error(String),
     Success(),
-}
-
-/// How dropout indices are encoded in DecryptMaskRequest.
-#[derive(Serialize, Deserialize, Debug)]
-pub enum DropoutList {
-    /// 3-byte packed indices (lower bandwidth)
-    Packed(Vec<crate::ClientIndex>),
-    /// Plain u32 indices (faster to serialize/deserialize)
-    Plain(Vec<u32>),
-}
-
-impl DropoutList {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Packed(v) => v.len(),
-            Self::Plain(v) => v.len(),
-        }
-    }
 }
 
 /// Reads a framed message from a TCP stream.
@@ -230,4 +218,3 @@ pub fn take_byte_counters() -> (u64, u64) {
     let recv = BYTES_RECV.swap(0, Ordering::Relaxed);
     (sent, recv)
 }
-
